@@ -7,6 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
             --primary-blue: #1400c6;
@@ -666,6 +667,7 @@
                     <option value="gaussian_smoothing">Gaussian Smoothing (Remove High-Frequency Noise)</option>
                     <option value="homomorphic_filter">Homomorphic Filter (Normalize Illumination)</option>
                     <option value="all_preprocessing">All Preprocessing Combined (Compare All Methods)</option>
+                    <option value="sequential_all">Sequential All Filters (Apply All Filters to One Image)</option>
                 </select>
                 <div class="enhancement-tip">
                     <span id="enhancement-tip">Select an enhancement method to improve image quality before analysis.</span>
@@ -690,9 +692,14 @@
             <div id="result-container">
                 <!-- Comparison Mode: Show all 7 preprocessing results -->
                 <div id="comparison-grid" style="display: none;">
-                    <h2 style="color: white; font-family: 'Space Grotesk', sans-serif; margin-bottom: 2rem; text-align: center;">
-                        All Preprocessing Methods Comparison
-                    </h2>
+                    <div id="comparison-header">
+                        <h2 style="color: white; font-family: 'Space Grotesk', sans-serif; margin-bottom: 2rem; text-align: center;">
+                            All Preprocessing Methods Comparison
+                        </h2>
+                    </div>
+                    <div style="background: #ffffff; padding: 1.5rem; border-radius: 16px; margin-bottom: 2rem;">
+                        <canvas id="comparisonChart"></canvas>
+                    </div>
                     <div id="comparison-results" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem;"></div>
                 </div>
                 
@@ -707,6 +714,16 @@
                             <img id="enhanced-display" alt="Enhanced Image">
                             <div class="comparison-label">After Preprocessing</div>
                         </div>
+                        <div class="comparison-item" id="gradcam-container" style="display: none;">
+                            <img id="gradcam-display" alt="Grad-CAM Visualization">
+                            <div class="comparison-label">Grad-CAM Heatmap</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Grad-CAM Explanation -->
+                    <div id="gradcam-explanation" style="display: none; margin-bottom: 2rem; padding: 1.5rem; background: rgba(126, 188, 89, 0.05); border: 1px solid rgba(126, 188, 89, 0.2); border-radius: 12px; border-left: 4px solid var(--accent-green);">
+                        <h3 style="color: var(--accent-green); font-family: 'Space Grotesk', sans-serif; margin-bottom: 0.75rem; font-size: 1.1rem;">Model Interpretability (Grad-CAM)</h3>
+                        <p style="color: var(--neutral-400); font-size: 0.95rem; line-height: 1.6; margin: 0;">The heatmap shows which regions of the leaf the model focused on to make its prediction. <strong style="color: #ff6b6b;">Red/yellow areas</strong> indicate high importance, while <strong style="color: #3b82f6;">blue areas</strong> are less important. A good prediction should focus on disease lesions, not the background.</p>
                     </div>
                     
                     <div class="result-card">
@@ -733,6 +750,9 @@
                     
                     <div class="top-predictions">
                         <h3>Top 3 Predictions</h3>
+                        <div style="background: #ffffff; padding: 1rem; border-radius: 12px; margin-bottom: 1rem;">
+                            <canvas id="singleResultChart"></canvas>
+                        </div>
                         <div id="top-predictions-list"></div>
                     </div>
                 </div>
@@ -762,6 +782,8 @@
         const enhancementTip = document.getElementById('enhancement-tip');
         
         let selectedFile = null;
+        let comparisonChartInstance = null;
+        let singleResultChartInstance = null;
         
         // Enhancement tips
         const enhancementTips = {
@@ -858,12 +880,32 @@
             formData.append('enhancement', enhancementSelect.value);
             
             try {
+                // Use AbortController with 5 minute timeout for all_preprocessing mode (7 Grad-CAMs)
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minutes
+                
                 const response = await fetch('/predict', {
                     method: 'POST',
-                    body: formData
+                    body: formData,
+                    signal: controller.signal
                 });
                 
-                const data = await response.json();
+                clearTimeout(timeoutId);
+                
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    showError(`Server error (${response.status}): ${errorText}`);
+                    return;
+                }
+                
+                let data;
+                try {
+                    data = await response.json();
+                } catch (jsonError) {
+                    console.error('JSON parse error:', jsonError);
+                    showError('Error parsing server response. Response may be too large or malformed.');
+                    return;
+                }
                 
                 if (data.success) {
                     // Add 2 second delay before showing results
@@ -873,7 +915,12 @@
                     showError(data.error || 'An error occurred during prediction');
                 }
             } catch (error) {
-                showError('Failed to connect to the server. Please try again.');
+                console.error('Fetch error:', error);
+                if (error.name === 'AbortError') {
+                    showError('Request timed out. The server is taking too long to process. Please try again.');
+                } else {
+                    showError('Failed to connect to the server. Error: ' + error.message);
+                }
             } finally {
                 loading.style.display = 'none';
                 predictBtn.disabled = false;
@@ -905,15 +952,21 @@
             document.getElementById('original-display').src = data.original_image;
             document.getElementById('enhanced-display').src = data.enhanced_image;
             
-            // Display quality warning if image is blurry
-            const qualityWarning = document.getElementById('quality-warning');
-            const qualityMessage = document.getElementById('quality-message');
-            if (data.quality_check && data.quality_check.is_blurry) {
-                qualityMessage.textContent = `Image appears blurry (Blur Score: ${data.quality_check.blur_score.toFixed(2)}). Prediction accuracy may be reduced. Consider using a clearer image.`;
-                qualityWarning.style.display = 'block';
+            // Display Grad-CAM if available
+            const gradcamContainer = document.getElementById('gradcam-container');
+            const gradcamExplanation = document.getElementById('gradcam-explanation');
+            if (data.gradcam_image) {
+                document.getElementById('gradcam-display').src = data.gradcam_image;
+                gradcamContainer.style.display = 'block';
+                gradcamExplanation.style.display = 'block';
             } else {
-                qualityWarning.style.display = 'none';
+                gradcamContainer.style.display = 'none';
+                gradcamExplanation.style.display = 'none';
             }
+            
+            // Quality warning hidden - blur detection still runs on backend but not shown to user
+            const qualityWarning = document.getElementById('quality-warning');
+            qualityWarning.style.display = 'none';
             
             // Display preprocessing advice
             if (data.preprocessing_advice) {
@@ -1017,6 +1070,9 @@
                 topPredictionsList.appendChild(item);
             });
             
+            // Render Single Result Chart
+            renderSingleResultChart(data.top_3);
+            
             resultContainer.style.display = 'block';
             
             // Scroll to results
@@ -1030,6 +1086,9 @@
             
             const comparisonResults = document.getElementById('comparison-results');
             comparisonResults.innerHTML = '';
+            
+            // Render Comparison Chart
+            renderComparisonChart(data.all_results);
             
             // Extract expected answer from filename
             let expectedAnswer = null;
@@ -1046,7 +1105,7 @@
             // Show expected answer and warnings in title section
             let headerHtml = '<h2 style="color: white; font-family: \'Space Grotesk\', sans-serif; margin-bottom: 2rem; text-align: center;">All Preprocessing Methods Comparison</h2>';
             
-            if (expectedAnswer) {
+            if (expectedAnswer && expectedAnswer.length > 0) {
                 headerHtml += `
                     <div style="text-align: center; margin-bottom: 1.5rem; padding: 1rem; background: rgba(126, 188, 89, 0.1); border-left: 4px solid #7ebc59; border-radius: 8px;">
                         <span style="color: #7ebc59; font-weight: 600;">Expected Answer: </span>
@@ -1067,7 +1126,8 @@
                 `;
             }
             
-            document.getElementById('comparison-grid').querySelector('h2').outerHTML = headerHtml;
+            // Use the header container instead of replacing h2 directly
+            document.getElementById('comparison-header').innerHTML = headerHtml;
             
             // Find best and worst results
             const confidences = data.all_results.map(r => r.confidence);
@@ -1086,7 +1146,7 @@
                 const normalizeString = (str) => str.toLowerCase().replace(/[^a-z]/g, '');
                 
                 const normalizedPrediction = normalizeString(result.prediction);
-                const normalizedExpected = normalizeString(expectedAnswer);
+                const normalizedExpected = expectedAnswer ? normalizeString(expectedAnswer) : '';
                 
                 // Calculate similarity: count matching words
                 const predWords = result.prediction.toLowerCase().split(/\s+/);
@@ -1098,11 +1158,11 @@
                 ).length;
                 
                 // Consider correct if at least 70% of expected words match
-                const matchThreshold = Math.ceil(expWords.length * 0.7);
-                const isCorrectPrediction = expectedAnswer && matchingWords >= matchThreshold;
+                const matchThreshold = expWords.length > 0 ? Math.ceil(expWords.length * 0.7) : 0;
+                const isCorrectPrediction = expectedAnswer && expWords.length > 0 && matchingWords >= matchThreshold;
                 
                 // Only flag as wrong if it doesn't match expected answer
-                const isWrongPrediction = expectedAnswer && !isCorrectPrediction;
+                const isWrongPrediction = expectedAnswer && expWords.length > 0 && !isCorrectPrediction;
                 
                 let borderColor = 'rgba(255, 255, 255, 0.1)';
                 let badgeHtml = '';
@@ -1142,13 +1202,22 @@
                     `;
                 }
                 
+                // Build Grad-CAM section if available
+                const gradcamHtml = result.gradcam_image ? `
+                    <div style="margin-top: 0.75rem;">
+                        <div style="color: var(--accent-green); font-size: 0.85rem; font-weight: 600; margin-bottom: 0.5rem;">Grad-CAM Heatmap:</div>
+                        <img src="${result.gradcam_image}" alt="Grad-CAM for ${result.method}" style="width: 100%; border-radius: 8px; border: 1px solid rgba(126, 188, 89, 0.3);">
+                    </div>
+                ` : '';
+                
                 card.innerHTML = `
                     ${badgeHtml}
                     <h3 style="color: #1400c6; font-family: 'Space Grotesk', sans-serif; margin-bottom: 1rem; font-size: 1.1rem;">
                         ${result.method}
                     </h3>
                     <img src="${result.image}" alt="${result.method}" style="width: 100%; border-radius: 8px; margin-bottom: 1rem; border: 1px solid rgba(255, 255, 255, 0.1);">
-                    <div style="margin-bottom: 0.75rem;">
+                    ${gradcamHtml}
+                    <div style="margin-bottom: 0.75rem; margin-top: 0.75rem;">
                         <div style="color: white; font-size: 1.1rem; font-weight: 600; margin-bottom: 0.5rem;">
                             ${result.prediction.replace(/_/g, ' ')}
                         </div>
@@ -1175,6 +1244,133 @@
             errorMessage.textContent = message;
             errorMessage.style.display = 'block';
             resultContainer.style.display = 'none';
+        }
+
+        function renderComparisonChart(results) {
+            const ctx = document.getElementById('comparisonChart').getContext('2d');
+            
+            if (comparisonChartInstance) {
+                comparisonChartInstance.destroy();
+            }
+            
+            // Matplotlib default color cycle (tab10)
+            const mplColors = [
+                '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
+                '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
+            ];
+            
+            const labels = results.map(r => r.method);
+            const data = results.map(r => r.confidence);
+            
+            // Assign a different color to each bar, cycling through the palette
+            const backgroundColors = results.map((r, i) => mplColors[i % mplColors.length]);
+            const borderColors = results.map((r, i) => mplColors[i % mplColors.length]);
+
+            comparisonChartInstance = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Confidence Score (%)',
+                        data: data,
+                        backgroundColor: backgroundColors,
+                        borderColor: borderColors,
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            max: 100,
+                            grid: {
+                                color: 'rgba(0, 0, 0, 0.1)'
+                            },
+                            ticks: {
+                                color: '#333333'
+                            }
+                        },
+                        x: {
+                            grid: {
+                                display: false
+                            },
+                            ticks: {
+                                color: '#333333'
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false,
+                            labels: {
+                                color: '#333333'
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function renderSingleResultChart(top3) {
+            const ctx = document.getElementById('singleResultChart').getContext('2d');
+            
+            if (singleResultChartInstance) {
+                singleResultChartInstance.destroy();
+            }
+            
+            // Matplotlib default color cycle (tab10)
+            const mplColors = [
+                '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
+                '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
+            ];
+            
+            const labels = top3.map(p => p.class.replace(/_/g, ' '));
+            const data = top3.map(p => p.confidence);
+            
+            singleResultChartInstance = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Probability (%)',
+                        data: data,
+                        backgroundColor: mplColors.slice(0, 3),
+                        borderColor: mplColors.slice(0, 3),
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    indexAxis: 'y',
+                    responsive: true,
+                    scales: {
+                        x: {
+                            beginAtZero: true,
+                            max: 100,
+                            grid: {
+                                color: 'rgba(0, 0, 0, 0.1)'
+                            },
+                            ticks: {
+                                color: '#333333'
+                            }
+                        },
+                        y: {
+                            grid: {
+                                display: false
+                            },
+                            ticks: {
+                                color: '#333333'
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false
+                        }
+                    }
+                }
+            });
         }
     </script>
 </body>
