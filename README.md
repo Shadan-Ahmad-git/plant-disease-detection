@@ -241,11 +241,7 @@ gunicorn -w 4 -b 0.0.0.0:5000 app:app
 * [ ] Mobile app version
 * [ ] Database integration
 
-## License
+## Contributors
 
-This project is provided as-is for educational and research purposes.
-
-
-
-
-
+Reetam Dan  
+Shadan Ahmad 
